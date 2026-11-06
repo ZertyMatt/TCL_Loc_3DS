@@ -11,42 +11,61 @@
 static PrintConsole top, bot;
 
 // ---------- HTTP ----------
-static char *http_get(const char *url) {
+static char last_err[160] = "";
+
+static char *http_get_once(const char *url) {
     httpcContext ctx;
-    if (R_FAILED(httpcOpenContext(&ctx, HTTPC_METHOD_GET, url, 1))) return NULL;
-    httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify);           // évite les soucis de certificats
-    httpcAddRequestHeaderField(&ctx, "User-Agent", "tcl3ds/0.1");
-    if (R_FAILED(httpcBeginRequest(&ctx))) { httpcCloseContext(&ctx); return NULL; }
+    Result rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, url, 1);
+    if (R_FAILED(rc)) { snprintf(last_err, sizeof last_err, "open: %08lX", rc); return NULL; }
+    httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify);           // evite les soucis de certificats
+    httpcAddRequestHeaderField(&ctx, "User-Agent", "tcl3ds/0.2");
+    rc = httpcBeginRequest(&ctx);
+    if (R_FAILED(rc)) { snprintf(last_err, sizeof last_err, "requete: %08lX", rc); httpcCloseContext(&ctx); return NULL; }
     u32 status = 0;
     httpcGetResponseStatusCode(&ctx, &status);
-    // redirections
     for (int i = 0; i < 3 && status >= 300 && status < 400; i++) {
         char loc[512];
         if (R_FAILED(httpcGetResponseHeader(&ctx, "Location", loc, sizeof loc))) break;
         httpcCloseContext(&ctx);
-        if (R_FAILED(httpcOpenContext(&ctx, HTTPC_METHOD_GET, loc, 1))) return NULL;
+        rc = httpcOpenContext(&ctx, HTTPC_METHOD_GET, loc, 1);
+        if (R_FAILED(rc)) { snprintf(last_err, sizeof last_err, "redir open: %08lX", rc); return NULL; }
         httpcSetSSLOpt(&ctx, SSLCOPT_DisableVerify);
-        httpcBeginRequest(&ctx);
+        rc = httpcBeginRequest(&ctx);
+        if (R_FAILED(rc)) { snprintf(last_err, sizeof last_err, "redir req: %08lX", rc); httpcCloseContext(&ctx); return NULL; }
         httpcGetResponseStatusCode(&ctx, &status);
     }
-    if (status != 200) { httpcCloseContext(&ctx); return NULL; }
+    if (status != 200) { snprintf(last_err, sizeof last_err, "HTTP %lu", status); httpcCloseContext(&ctx); return NULL; }
     u32 cap = 0x8000, len = 0, got = 0;
     char *buf = malloc(cap);
-    if (!buf) { httpcCloseContext(&ctx); return NULL; }
-    Result rc;
+    if (!buf) { snprintf(last_err, sizeof last_err, "memoire"); httpcCloseContext(&ctx); return NULL; }
     do {
         rc = httpcDownloadData(&ctx, (u8 *)buf + len, cap - len - 1, &got);
         len += got;
         if (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING) {
             cap *= 2;
             char *nb = realloc(buf, cap);
-            if (!nb) { free(buf); httpcCloseContext(&ctx); return NULL; }
+            if (!nb) { free(buf); snprintf(last_err, sizeof last_err, "memoire (%lu Ko)", cap / 1024); httpcCloseContext(&ctx); return NULL; }
             buf = nb;
         }
     } while (rc == (Result)HTTPC_RESULTCODE_DOWNLOADPENDING);
     httpcCloseContext(&ctx);
+    if (R_FAILED(rc)) { snprintf(last_err, sizeof last_err, "download: %08lX", rc); free(buf); return NULL; }
     buf[len] = 0;
     return buf;
+}
+
+// Reessaie jusqu'a 4 fois (Render peut mettre ~1 min a se reveiller)
+static char *http_get(const char *url) {
+    for (int t = 1; t <= 4; t++) {
+        printf("\x1b[3;1H\x1b[0mTentative %d/4 ...        ", t);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        char *r = http_get_once(url);
+        if (r) return r;
+        printf("\x1b[4;1H%-48.48s", last_err);
+        gfxFlushBuffers(); gfxSwapBuffers();
+        if (t < 4) svcSleepThread(8000000000LL);
+    }
+    return NULL;
 }
 
 static cJSON *api_values(const char *path) {
@@ -55,6 +74,7 @@ static cJSON *api_values(const char *path) {
     char *txt = http_get(url);
     if (!txt) return NULL;
     cJSON *root = cJSON_Parse(txt);
+    if (!root) snprintf(last_err, sizeof last_err, "JSON invalide (%.40s)", txt);
     free(txt);
     return root;
 }
@@ -131,7 +151,7 @@ static void screen_traffic(void) {
     cJSON *root = api_values("/api/traffic");
     cJSON *vals = root ? cJSON_GetObjectItem(root, "values") : NULL;
     int n = cJSON_GetArraySize(vals);
-    if (!root || n <= 0) { head("Infos trafic"); printf(root ? "Aucune perturbation." : "Erreur reseau."); wait_a(); cJSON_Delete(root); return; }
+    if (!root || n <= 0) { head("Infos trafic"); if (root) printf("Aucune perturbation."); else printf("Erreur reseau.\n\n%s", last_err); wait_a(); cJSON_Delete(root); return; }
     char **items = calloc(n, sizeof *items);
     for (int i = 0; i < n; i++) {
         cJSON *a = cJSON_GetArrayItem(vals, i);
@@ -156,7 +176,7 @@ static void screen_velov(void) {
     cJSON *root = api_values("/api/velov");
     cJSON *vals = root ? cJSON_GetObjectItem(root, "values") : NULL;
     int n = cJSON_GetArraySize(vals);
-    if (!root || n <= 0) { head("Velo'v"); printf("Erreur reseau."); wait_a(); cJSON_Delete(root); return; }
+    if (!root || n <= 0) { head("Velo'v"); printf("Erreur reseau.\n\n%s", last_err); wait_a(); cJSON_Delete(root); return; }
     static char kbuf[64] = "";
     SwkbdState kb;
     swkbdInit(&kb, SWKBD_TYPE_NORMAL, 2, 40);
@@ -188,7 +208,7 @@ static void show_passages(const char *id, const char *nom) {
     cJSON *vals = root ? cJSON_GetObjectItem(root, "values") : NULL;
     int n = cJSON_GetArraySize(vals);
     head(nom);
-    if (!root) printf("Erreur reseau.");
+    if (!root) printf("Erreur reseau.\n\n%s", last_err);
     else if (n <= 0) printf("Aucun passage prevu.");
     else for (int i = 0; i < n && i < 22; i++) {
         cJSON *v = cJSON_GetArrayItem(vals, i);
@@ -204,7 +224,7 @@ static void screen_stops(void) {
     cJSON *root = api_values("/api/stops");
     cJSON *vals = root ? cJSON_GetObjectItem(root, "values") : NULL;
     int n = cJSON_GetArraySize(vals);
-    if (!root || n <= 0) { head("Arrets"); printf("Erreur reseau ou memoire."); wait_a(); cJSON_Delete(root); return; }
+    if (!root || n <= 0) { head("Arrets"); printf("Erreur reseau ou memoire.\n\n%s", last_err); wait_a(); cJSON_Delete(root); return; }
     while (aptMainLoop()) {
         static char kbuf[64] = "";
         SwkbdState kb;
